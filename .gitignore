@@ -1,0 +1,18 @@
+# 爬取产物 / 数据，不上传
+*.xlsx
+*.xls
+*.jsonl
+*.raw.jsonl
+calibration_dump.json
+calibration_snapshot.txt
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 系统/编辑器
+.DS_Store
+.vscode/
+.idea/
