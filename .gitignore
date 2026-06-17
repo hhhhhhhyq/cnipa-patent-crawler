@@ -3,6 +3,7 @@
 *.xls
 *.jsonl
 *.raw.jsonl
+*.progress.txt
 calibration_dump.json
 calibration_snapshot.txt
 

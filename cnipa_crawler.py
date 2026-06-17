@@ -22,6 +22,7 @@ import argparse
 import base64
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -34,12 +35,22 @@ import pandas as pd
 CDP_PORT = "9222"
 SEARCH_URL = "https://pss-system.cponline.cnipa.gov.cn/conventionalSearch"
 PAGE_LIMIT_LABEL = "40 条/页"
-WAIT_SEARCH = 7.0
-WAIT_ACTION = 4.0
 MAX_PAGES = 600
-DELAY_BETWEEN_COMPANIES = 3.0
 INV_TYPE = {"FM": "发明", "SX": "实用新型", "SY": "实用新型",
             "WG": "外观设计", "WS": "外观设计", "XX": "实用新型"}
+
+# 等待时间均为【随机区间】(秒)，每次取区间内随机值，避免固定节奏被识别为机器
+WAIT_SEARCH = (6.0, 10.0)        # 检索/导航后
+WAIT_ACTION = (3.5, 6.5)         # 翻页/下拉/确定等页内操作后
+DELAY_COMPANIES = (3.0, 8.0)     # 公司与公司之间
+WAIT_CITE = (1.0, 2.4)           # --citations 时每条专利之间
+WAIT_TINY = (0.4, 1.0)           # 输入/聚焦等小停顿
+
+
+def nap(span):
+    """在区间 (lo, hi) 内随机睡眠。"""
+    lo, hi = span
+    time.sleep(random.uniform(lo, hi))
 
 
 # ── agent-browser 封装 ────────────────────────────────────────────────────────
@@ -166,6 +177,47 @@ def check_logged_in():
     return ab_eval("localStorage.getItem('token')?'yes':'no'") == "yes"
 
 
+# ── 风控 / 异常检测 + 退避重试 ───────────────────────────────────────────────────
+BASE_BACKOFF = 30.0      # 首次退避秒数
+MAX_BACKOFF = 600.0      # 单次退避上限（10 分钟）
+RECOVER_TRIES = 6        # 最多退避重试次数
+
+
+def page_health():
+    """返回 'ok' | 'logout' | 'block'。
+    - logout：token 丢失或跳转登录页（需你在 Chrome 重新登录）。
+    - block ：页面出现限流/风控提示弹窗（频繁/繁忙/验证/稍后/拒绝/限制 等）。
+    只看错误弹窗/对话框，避免把正文里的'验证'等词误判。"""
+    js = ("(function(){var href=location.href.toLowerCase();"
+          "if(!localStorage.getItem('token')||href.indexOf('login')>=0)return 'logout';"
+          "var ws=['频繁','稍后','繁忙','人机','滑动验证','拒绝访问','访问受限','请求过','too many','forbidden','rate limit'];"
+          "var ns=document.querySelectorAll('.el-message,.el-message-box__message,.el-notification__content,.el-dialog__body');"
+          "for(var i=0;i<ns.length;i++){if(ns[i].offsetParent){var t=ns[i].textContent||'';"
+          "for(var j=0;j<ws.length;j++){if(t.indexOf(ws[j])>=0)return 'block';}}}"
+          "return 'ok';})()")
+    h = ab_eval(js)
+    return h if h in ("ok", "logout", "block") else "ok"
+
+
+def wait_recover(reason, navigate=False):
+    """检测到异常后指数退避并重新检查健康；恢复返回 True，超限返回 False。"""
+    for i in range(RECOVER_TRIES):
+        wait = min(MAX_BACKOFF, BASE_BACKOFF * (2 ** i))
+        h = page_health()
+        if h == "logout":
+            print(f"   ⏸ {reason}：登录态失效，请在 Chrome 里重新登录 CNIPA。"
+                  f"等待 {int(wait)}s 后重试（{i + 1}/{RECOVER_TRIES}）…")
+        else:
+            print(f"   ⏸ {reason}：疑似限流/风控，退避 {int(wait)}s 后重试（{i + 1}/{RECOVER_TRIES}）…")
+        time.sleep(wait)
+        if navigate:
+            goto_search_page()
+        if page_health() == "ok":
+            print("   ▶ 已恢复，继续")
+            return True
+    return False
+
+
 # ── 字段解析（基于实测真实字段）─────────────────────────────────────────────────
 def extract_item(record, en_name):
     items = record.get("items") or {}
@@ -223,6 +275,7 @@ def normalize(record, company):
         "申请人所在国/地区": extract_item(record, "AC"),
         "主IPC分类号": record.get("ipcMain") or "",
         "IPC分类号": join_ipc(record),
+        "被引证次数": record.get("_citedCount", ""),
         "摘要": extract_abstract(record),
     }
 
@@ -267,7 +320,7 @@ def select_dropdown_option(open_value_pat, option_text, scope=".el-select"):
             "for(var i=0;i<s.length;i++){if(new RegExp(%r).test(s[i].value)){"
             "s[i].dispatchEvent(new MouseEvent('mousedown',{bubbles:true}));s[i].click();return 'ok';}}"
             "return 'none';})()" % (json.dumps(scope), open_value_pat))
-    time.sleep(1.2)
+    nap((0.9, 1.7))
     return ab_eval("(function(){var its=document.querySelectorAll('.el-select-dropdown__item');"
                    "for(var i=0;i<its.length;i++){if(its[i].textContent.trim()===%s){its[i].click();return 'picked';}}"
                    "return 'noopt';})()" % json.dumps(option_text))
@@ -283,11 +336,11 @@ def set_apd_filter(start_disp, end_disp):
             return False
         ab_press("Control+a"); ab_press("Delete")
         ab_type(value)
-        time.sleep(0.4)
+        nap(WAIT_TINY)
         ab_press("Enter")
-        time.sleep(0.4)
+        nap(WAIT_TINY)
         ab_eval("document.body.click()")
-        time.sleep(0.3)
+        nap((0.3, 0.7))
         return True
 
     if start_disp:
@@ -298,7 +351,7 @@ def set_apd_filter(start_disp, end_disp):
     net_clear()
     ab_eval("(function(){var bs=document.querySelectorAll('button.el-button--primary');"
             "for(var i=0;i<bs.length;i++){if((bs[i].textContent||'').trim()==='确定'&&bs[i].offsetParent){bs[i].click();return 'ok';}}return 'no';})()")
-    time.sleep(WAIT_ACTION)
+    nap(WAIT_ACTION)
     return True
 
 
@@ -307,22 +360,72 @@ def click_next_page():
                    "if(b&&!b.disabled){b.click();return 'ok';}return 'end';})()") == "ok"
 
 
-def do_search(company):
-    """conventionalSearch：自动识别框真实键入公司名 + 回车 → 导航到 retrieveList。"""
+def fetch_citations_current_page():
+    """点当前页每条专利的【被引证】按钮，抓 patcitedinfos 的 totalCount。
+
+    返回 {anId: 被引证次数}。逐条点击较慢，仅在 --citations 时启用。
+    """
+    net_clear()
+    n = ab_eval("(function(){var a=document.querySelectorAll('li,span,div'),c=0;"
+                "for(var i=0;i<a.length;i++){if((a[i].textContent||'').trim()==='被引证'&&a[i].offsetParent)c++;}return c;})()")
+    try:
+        n = int(n)
+    except ValueError:
+        n = 0
+    for idx in range(n):
+        ab_eval("(function(){var a=document.querySelectorAll('li,span,div'),c=-1;"
+                "for(var i=0;i<a.length;i++){if((a[i].textContent||'').trim()==='被引证'&&a[i].offsetParent){c++;"
+                "if(c===%d){a[i].click();return 'ok';}}}return 'no';})()" % idx)
+        nap(WAIT_CITE)
+    nap((1.0, 1.8))
+    # 收集所有 patcitedinfos 响应，按 anId 映射次数
+    out = _ab("network", "requests", "--filter", "patcitedinfos", "--json", timeout=60)
+    try:
+        reqs = json.loads(out).get("data", {}).get("requests", [])
+    except Exception:
+        return {}
+    mapping = {}
+    for r in reqs:
+        det = _ab("network", "request", str(r.get("requestId")), "--json", timeout=60)
+        try:
+            data = json.loads(det).get("data", {})
+            an = (json.loads(data.get("postData") or "{}").get("param") or {}).get("anId")
+            tc = (json.loads(data.get("responseBody") or "{}").get("t") or {}).get("pagination", {}).get("totalCount")
+            if an is not None and tc is not None:
+                mapping[an] = tc
+        except Exception:
+            continue
+    return mapping
+
+
+def do_search_once(company):
     goto_search_page()
     if ab_eval("(function(){var el=document.querySelector('input[placeholder*=\"智能识别检索\"],textarea[placeholder*=\"智能识别检索\"]');"
                "if(el){el.focus();el.value='';return 'ok';}return 'no';})()") != "ok":
-        print("   ! 未找到检索框"); return False
-    time.sleep(0.5)
+        return False
+    nap(WAIT_TINY)
     ab_type(company)
-    time.sleep(0.6)
+    nap(WAIT_TINY)
     net_clear()
     ab_press("Enter")
-    time.sleep(WAIT_SEARCH)
+    nap(WAIT_SEARCH)
     return "retrieveList" in ab_eval("location.href")
 
 
-def search_company(company, start_disp, end_disp, start_i, end_i, basis):
+def do_search(company):
+    """检索并导航到结果页；失败时检测风控/登录态并退避重试。"""
+    for attempt in range(3):
+        if do_search_once(company):
+            return True
+        h = page_health()
+        if h == "ok":
+            return False  # 不是风控，纯粹没进结果页（如检索框没找到），交由上层处理
+        if not wait_recover("检索未成功", navigate=True):
+            return False
+    return False
+
+
+def search_company(company, start_disp, end_disp, start_i, end_i, basis, with_citations):
     if not do_search(company):
         print("   ! 检索后未进入结果页，跳过"); return []
 
@@ -337,28 +440,45 @@ def search_company(company, start_disp, end_disp, start_i, end_i, basis):
     # 设 40 条/页 —— 原地触发并抓到第 1 页
     net_clear()
     select_dropdown_option(r"条/页", PAGE_LIMIT_LABEL, scope=".el-pagination .el-select")
-    time.sleep(WAIT_ACTION)
+    nap(WAIT_ACTION)
 
     records, seen = [], set()
 
     def harvest():
-        new = 0
+        """收割当前已捕获 getResults 的新记录，返回本批新记录列表。"""
+        page_recs = []
         for rec in net_all_getresults_records():
             key = rec.get("vid") or json.dumps(rec, sort_keys=True, ensure_ascii=False)[:200]
             if key in seen:
                 continue
-            seen.add(key); records.append(rec); new += 1
-        return new
+            seen.add(key); records.append(rec); page_recs.append(rec)
+        return page_recs
 
-    harvest()
+    def attach_citations(page_recs):
+        if not with_citations or not page_recs:
+            return
+        cmap = fetch_citations_current_page()
+        for rec in page_recs:
+            if rec.get("anId") in cmap:
+                rec["_citedCount"] = cmap[rec["anId"]]
+
+    attach_citations(harvest())
     # 翻页直到没有下一页
     for _ in range(MAX_PAGES):
         net_clear()
         if not click_next_page():
             break
-        time.sleep(WAIT_ACTION)
-        if harvest() == 0:
-            break
+        nap(WAIT_ACTION)
+        page_recs = harvest()
+        if not page_recs:
+            # 区分“真的没有下一页”与“被风控/掉登录导致空”
+            if page_health() != "ok":
+                if wait_recover("翻页无数据", navigate=False):
+                    net_clear(); nap(WAIT_ACTION)
+                    page_recs = harvest()
+            if not page_recs:
+                break
+        attach_citations(page_recs)
     else:
         print(f"     ⚠ 达到翻页上限 {MAX_PAGES}，可能未取完")
     return records
@@ -389,11 +509,55 @@ def cmd_run(args):
     companies = read_companies(args.input)
     print(f"→ {len(companies)} 家公司")
 
-    all_rows, raw_path = [], args.output + ".raw.jsonl"
+    raw_path = args.output + ".raw.jsonl"
+    progress_path = args.output + ".progress.txt"
+
+    # ── 断点续抓：读取已完成公司，并从备份恢复已抓数据 ──
+    done = set()
+    if os.path.exists(progress_path):
+        with open(progress_path, encoding="utf-8") as f:
+            done = {ln.strip() for ln in f if ln.strip()}
+
+    all_rows = []
+    if done:
+        print(f"↻ 断点续抓：检测到已完成 {len(done)} 家，将跳过并恢复其数据")
+        # 从 raw 备份重建已完成公司的行，并把 raw 清理成只含已完成公司（避免重复）
+        if os.path.exists(raw_path):
+            keep_lines = []
+            with open(raw_path, encoding="utf-8") as f:
+                for ln in f:
+                    try:
+                        obj = json.loads(ln)
+                    except Exception:
+                        continue
+                    if obj.get("company") in done:
+                        keep_lines.append(ln if ln.endswith("\n") else ln + "\n")
+                        all_rows.append(normalize(obj["record"], obj["company"]))
+            with open(raw_path, "w", encoding="utf-8") as f:
+                f.writelines(keep_lines)
+        if all_rows:
+            pd.DataFrame(all_rows).to_excel(args.output, index=False)
+    else:
+        # 全新开始：清掉可能残留的旧备份，避免污染
+        if os.path.exists(raw_path):
+            os.remove(raw_path)
+
+    todo = sum(1 for c in companies if c not in done)
+    print(f"→ 待抓 {todo} 家（共 {len(companies)} 家，已完成 {len(companies) - todo} 家）")
+
     for i, company in enumerate(companies, 1):
+        if company in done:
+            print(f"[{i}/{len(companies)}] {company} —— 已完成，跳过")
+            continue
         print(f"[{i}/{len(companies)}] {company}")
+        # 每家公司前先体检：异常则退避；持续无法恢复就停止（已抓数据已落盘，恢复后可继续）
+        if page_health() != "ok":
+            if not wait_recover("公司检索前检测到异常", navigate=True):
+                print("✗ 持续异常无法恢复，已停止。已完成的公司不会重抓，恢复后重跑同一命令即可续抓。")
+                break
         try:
-            recs = search_company(company, start_disp, end_disp, start_i, end_i, args.date_basis)
+            recs = search_company(company, start_disp, end_disp, start_i, end_i,
+                                  args.date_basis, args.citations)
         except Exception as e:
             print(f"   ! 出错: {e}"); recs = []
         kept = [r for r in recs if in_range(r, start_i, end_i, args.date_basis)]
@@ -404,10 +568,16 @@ def cmd_run(args):
         with open(raw_path, "a", encoding="utf-8") as f:
             for r in kept:
                 f.write(json.dumps({"company": company, "record": r}, ensure_ascii=False) + "\n")
-        time.sleep(DELAY_BETWEEN_COMPANIES)
+        # 标记本公司完成（写在数据落盘之后，确保只有完整处理过的才算完成）
+        with open(progress_path, "a", encoding="utf-8") as f:
+            f.write(company + "\n")
+        done.add(company)
+        nap(DELAY_COMPANIES)
 
     if all_rows:
         print(f"\n✓ 完成，共 {len(all_rows)} 条 → {args.output}")
+        if len(done) >= len(set(companies)):
+            print(f"  全部 {len(set(companies))} 家已抓完。如需重新抓取，请删除 {progress_path}")
     else:
         print("\n⚠ 没抓到数据。")
 
@@ -422,6 +592,8 @@ def main():
     rp.add_argument("--end", help="截止日期 如 2023-12-31")
     rp.add_argument("--date-basis", default="申请日", choices=["申请日", "公开日"],
                     help="客户端兜底过滤依据（服务端过滤固定按申请日）")
+    rp.add_argument("--citations", action="store_true",
+                    help="额外抓取每条专利的被引证次数（逐条点击，很慢、请求多，慎用）")
     args = p.parse_args()
     if args.cmd == "run":
         cmd_run(args)
